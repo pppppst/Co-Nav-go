@@ -42,11 +42,25 @@ def vis_result_fast(
     )
     
     # Generate labels
-    labels = [
-        f"{classes[class_id]} {confidence:0.2f}" 
-        for _, _, confidence, class_id, _, _
-        in detections
-    ]
+    # labels = [
+    #     f"{classes[class_id]} {confidence:0.2f}" 
+    #     for _, _, confidence, class_id, _, _
+    #     in detections
+    # ]
+    
+    labels = []
+
+    for det in detections:
+        # det[2] 是置信度
+        confidence = det[2]
+        
+        # det[3] 是类别 ID，需要转为整数索引
+        class_id = int(det[3])
+        
+        # 生成标签字符串，例如 "person 0.85"
+        label_str = f"{classes[class_id]} {confidence:0.2f}"
+        
+        labels.append(label_str)
     
     if instance_random_color:
         # Generate random colors for each instance

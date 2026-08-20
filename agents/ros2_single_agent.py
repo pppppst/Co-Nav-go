@@ -107,12 +107,20 @@ class ROS_Agent(VLM_Agent):
         # 3D mapping
         self.point_sum = o3d.geometry.PointCloud()
         self.object_pcd = o3d.geometry.PointCloud()
+        self.pending_object_pcd = o3d.geometry.PointCloud()
+        self.target_confirm_count = 0
+        self.target_miss_count = 0
     
         self.init_sim_position = None
         self.init_sim_rotation = None
         self.Open3D_traj = []
         self.plan_path = []
         self.nearest_point = None
+        self.target_distance = None
+        self.target_grid_pose = None
+        self.visible_target = False
+        self.visible_target_distance = None
+        self.visible_target_center_offset = None
         self.current_grid_pose = None
         self.camera_position = None
         
@@ -152,7 +160,7 @@ class ROS_Agent(VLM_Agent):
             self.init_sim_position = observations['pose'][:3, 3]
             self.init_sim_rotation = observations['pose'][:3, :3]
 
-            self.goal_name = "sink"
+            self.goal_name = "chair"
             self.goal_id = self.classes.index(self.goal_name)
             
             self.camera_K = observations['cam_K']
@@ -178,9 +186,22 @@ class ROS_Agent(VLM_Agent):
         detections = self.obj_det_seg.detect(image) 
         
         n_masks = len(detections.xyxy)
+        target_frame_pcd = o3d.geometry.PointCloud()
+        immediate_target_commit = False
+        self.visible_target = False
+        self.visible_target_distance = None
+        self.visible_target_center_offset = None
         for mask_idx in range(n_masks):
             if self.goal_id == detections.class_id[mask_idx] and (detections.confidence[mask_idx] > self.args.sem_threshold or ('plant' in self.goal_name and detections.confidence[mask_idx] > 0.5)):
                 mask = detections.mask[mask_idx]
+                mask_ratio = float(np.mean(mask))
+                if mask_ratio > self.args.target_max_mask_ratio:
+                    if self.args.target_debug:
+                        print(
+                            f"[TARGET_SKIP] {self.goal_name} conf={detections.confidence[mask_idx]:.3f} "
+                            f"mask_ratio={mask_ratio:.3f} > {self.args.target_max_mask_ratio:.3f}"
+                        )
+                    continue
 
                 # make the pcd and color it
                 camera_object_pcd = create_object_pcd(
@@ -190,14 +211,59 @@ class ROS_Agent(VLM_Agent):
                     image,
                     obj_color = None
                 )
-                
-                if len(camera_object_pcd.points) < 10: 
+
+                point_count = len(camera_object_pcd.points)
+                if point_count >= self.args.target_visual_min_points:
+                    self.update_visible_target_state(mask, camera_object_pcd)
+
+                # if len(camera_object_pcd.points) < 10:
+                if point_count < self.args.target_min_points:
+                    if self.args.target_debug:
+                        print(
+                            f"[TARGET_SKIP] {self.goal_name} conf={detections.confidence[mask_idx]:.3f} "
+                            f"points={point_count} < {self.args.target_min_points}"
+                        )
                     continue
                 
                 camera_object_pcd.transform(camera_matrix_T)
                 # camera_object_pcd = process_pcd(camera_object_pcd)
                 
-                self.object_pcd += camera_object_pcd
+                # self.object_pcd += camera_object_pcd
+                target_frame_pcd += camera_object_pcd
+
+                if self.args.target_debug:
+                    print(
+                        f"[TARGET_CANDIDATE] {self.goal_name} conf={detections.confidence[mask_idx]:.3f} "
+                        f"mask_ratio={mask_ratio:.3f} points={point_count}"
+                    )
+
+                if detections.confidence[mask_idx] >= self.args.target_immediate_confidence:
+                    immediate_target_commit = True
+
+        if len(target_frame_pcd.points) > 0:
+            self.target_miss_count = 0
+            if immediate_target_commit:
+                self.object_pcd += target_frame_pcd
+                self.pending_object_pcd = o3d.geometry.PointCloud()
+                self.target_confirm_count = self.args.target_confirm_frames
+                if self.args.target_debug:
+                    print(f"[TARGET_COMMIT] {self.goal_name} high-confidence immediate commit")
+            else:
+                self.target_confirm_count += 1
+                self.pending_object_pcd += target_frame_pcd
+                if self.args.target_debug:
+                    print(
+                        f"[TARGET_CONFIRM] {self.goal_name} "
+                        f"{self.target_confirm_count}/{self.args.target_confirm_frames}"
+                    )
+                if self.target_confirm_count >= self.args.target_confirm_frames:
+                    self.object_pcd += self.pending_object_pcd
+                    self.pending_object_pcd = o3d.geometry.PointCloud()
+        else:
+            self.target_miss_count += 1
+            if self.target_miss_count > self.args.target_confirm_miss_tolerance:
+                self.target_confirm_count = 0
+                self.pending_object_pcd = o3d.geometry.PointCloud()
 
         proc_end_time = time.time()
         # print('proc_time: %.3f秒'%(proc_end_time-proc_time))
@@ -290,12 +356,19 @@ class ROS_Agent(VLM_Agent):
             if self.found_goal == False:
                 self.goal_map = np.zeros((self.local_w, self.local_h))
             goal_pcd = process_pcd(self.object_pcd)
-            self.goal_map[self.object_map_building(goal_pcd)] = 1
-            self.nearest_point = self.find_nearest_point_cloud(goal_pcd, self.camera_position)
-                       
-            self.found_goal = True
+            if len(goal_pcd.points) > 0:
+                self.goal_map[self.object_map_building(goal_pcd)] = 1
+                self.nearest_point = self.find_nearest_point_cloud(goal_pcd, self.camera_position)
+                self.update_target_approach_state(goal_pcd)
+                self.found_goal = True
+            else:
+                self.found_goal = False
+                self.target_distance = None
+                self.target_grid_pose = None
         else:
             self.found_goal = False
+            self.target_distance = None
+            self.target_grid_pose = None
             
             self.goal_map = np.zeros((self.local_w, self.local_h))
             self.goal_map[int(goal_points[0]), int(goal_points[1])] = 1
@@ -404,10 +477,34 @@ class ROS_Agent(VLM_Agent):
         if self.is_running == False:
             return None
         
-        if self.stop and self.found_goal:
+        target_close = (
+            self.found_goal and
+            self.target_distance is not None and
+            self.target_distance <= self.args.target_stop_distance
+        )
+
+        visible_target_close = (
+            self.visible_target and
+            self.visible_target_distance is not None and
+            self.visible_target_distance <= self.args.target_stop_distance
+        )
+
+        if self.args.target_visual_servo and self.visible_target:
+            if visible_target_close:
+                action = 0
+            elif self.visible_target_center_offset < -self.args.target_center_tolerance:
+                action = 2
+            elif self.visible_target_center_offset > self.args.target_center_tolerance:
+                action = 3
+            else:
+                action = 1
+        elif self.stop and self.found_goal and target_close:
             action = 0
         else:
-            (stg_x, stg_y) = self.stg
+            if self.stop and self.found_goal and self.target_grid_pose is not None:
+                stg_x, stg_y = self.target_grid_pose
+            else:
+                stg_x, stg_y = self.stg
             angle_st_goal = math.degrees(math.atan2(stg_x - self.current_grid_pose[0],
                                                     stg_y - self.current_grid_pose[1]))
             angle_agent = (360 - self.relative_angle) % 360.0
@@ -467,11 +564,19 @@ class ROS_Agent(VLM_Agent):
         goal = add_boundary(goal, value=0)
         traversible[goal==1] = 1
         planner = FMMPlanner(traversible)
-        if ("plant" in self.goal_name or "tv" in self.goal_name) and \
-            np.sum(self.goal_map) > 1:
-            selem = skimage.morphology.disk(15)
-        else: 
-            selem = skimage.morphology.disk(12)
+        # if ("plant" in self.goal_name or "tv" in self.goal_name) and \
+        #     np.sum(self.goal_map) > 1:
+        #     selem = skimage.morphology.disk(15)
+        # else: 
+        #     selem = skimage.morphology.disk(12)
+        if self.found_goal:
+            goal_dilation_cells = self.args.object_goal_dilation_cells
+        else:
+            goal_dilation_cells = self.args.frontier_goal_dilation_cells
+            if ("plant" in self.goal_name or "tv" in self.goal_name) and \
+                np.sum(self.goal_map) > 1:
+                goal_dilation_cells = max(goal_dilation_cells, 15)
+        selem = skimage.morphology.disk(goal_dilation_cells)
         goal = skimage.morphology.binary_dilation(
             goal, selem) != True
         goal = 1 - goal * 1.
@@ -595,6 +700,53 @@ class ROS_Agent(VLM_Agent):
         nearest_point = np.asarray(point_cloud.points)[idx[0]]
         
         return nearest_point
+
+    def update_visible_target_state(self, mask, camera_object_pcd):
+        points = np.asarray(camera_object_pcd.points)
+        if points.size == 0:
+            return
+
+        mask_points = np.argwhere(mask)
+        if mask_points.size == 0:
+            return
+
+        image_width = mask.shape[1]
+        center_x = float(np.mean(mask_points[:, 1]))
+        self.visible_target_center_offset = (center_x - image_width / 2.0) / (image_width / 2.0)
+        self.visible_target_distance = float(np.percentile(points[:, 2], self.args.target_distance_percentile))
+        self.visible_target = True
+
+        if self.args.target_debug:
+            print(
+                f"[TARGET_VISIBLE] {self.goal_name} distance={self.visible_target_distance:.2f}m "
+                f"center_offset={self.visible_target_center_offset:.2f}"
+            )
+
+    def update_target_approach_state(self, point_cloud):
+        points = np.asarray(point_cloud.points)
+        if points.size == 0:
+            self.target_distance = None
+            self.target_grid_pose = None
+            return
+
+        horizontal_delta = points[:, [0, 2]] - self.camera_position[[0, 2]]
+        distances = np.linalg.norm(horizontal_delta, axis=1)
+        percentile = np.clip(self.args.target_distance_percentile, 0.0, 100.0)
+        self.target_distance = float(np.percentile(distances, percentile))
+
+        target_point = np.median(points, axis=0)
+        target_x = np.floor(target_point[0] * 100 / self.args.map_resolution).astype(int) + int(self.origins_grid[0])
+        target_y = np.floor(target_point[2] * 100 / self.args.map_resolution).astype(int) + int(self.origins_grid[1])
+        self.target_grid_pose = [
+            max(1, min(int(target_x), self.map_size - 1)),
+            max(1, min(int(target_y), self.map_size - 1)),
+        ]
+
+        if self.args.target_debug:
+            print(
+                f"[TARGET_DISTANCE] {self.goal_name} distance={self.target_distance:.2f}m "
+                f"stop_threshold={self.args.target_stop_distance:.2f}m"
+            )
     
     
     def object_map_building(self, point_sum):
@@ -783,8 +935,8 @@ class ROS_Agent(VLM_Agent):
             fn = ep_dir + 'agent-{}-Vis-{}.png'.format(self.agent_id, self.l_step)
             cv2.imwrite(fn, vis_image_rgb)
 
-        if self.args.visualize:
-            cv2.imshow("episode_{}- agent_{}".format(self.episode_n, self.agent_id), vis_image_rgb)
-            cv2.waitKey(1)
+        # if self.args.visualize:
+        #     cv2.imshow("episode_{}- agent_{}".format(self.episode_n, self.agent_id), vis_image_rgb)
+        #     cv2.waitKey(1)
 
         return vis_image_show

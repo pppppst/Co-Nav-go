@@ -1,0 +1,58 @@
+/**:
+  ros__parameters:
+    preprocess:
+      # Go2 UTLiDAR publishes PointCloud2 with x/y/z/intensity/ring/time fields.
+      # Start from the Velodyne-style parser because it uses ring + per-point time.
+      lidar_type: 2
+      scan_line: 18
+      # The observed per-scan point time ends around 62 ms, so the UTLiDAR is
+      # effectively publishing near 16 Hz rather than 10 Hz.
+      scan_rate: 16
+      # Unit of the PointCloud2 time/t field:
+      # 0: second, 1: millisecond, 2: microsecond, 3: nanosecond.
+      # UTLiDAR commonly uses a Velodyne-like "time" field; change this if logs
+      # warn that point times are abnormal.
+      timestamp_unit: 0
+      blind: 0.1
+      blind_for_human_pilots: 0.1
+
+    mapping:
+      acc_cov: 0.5
+      gyr_cov: 0.3
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 80.0
+      extrinsic_est_en: false
+
+      # LiDAR pose with respect to the Go2 body IMU/base frame.
+      # FAST-LIO applies: p_imu = extrinsic_R * p_lidar + extrinsic_T.
+      extrinsic_T: [0.1710, 0.0, 0.0908]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+
+    gravity_alignment:
+      enable_gravity_alignment: false
+
+    filter_size_map: 0.3
+
+    publish:
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_lidarframe_pub_en: true
+      scan_bodyframe_pub_en: true
+      scan_baseframe_pub_en: true
+
+    pcd_save:
+      pcd_save_en: false
+      interval: -1
+
+    verbose: false
+    extrinsics_timeout_s: 30.0
+    runtime_pos_log_enable: false
+    point_filter_num_for_preprocessing: 1
+    point_filter_num: 4
+    max_iteration: 4
+    cube_side_length: 1000.0
